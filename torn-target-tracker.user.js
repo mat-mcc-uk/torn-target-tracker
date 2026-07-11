@@ -494,7 +494,7 @@
     }
 
     // Cash trend (requires 4+ wins to compare recent vs older).
-    if (stats?.trend !== null && stats.trend !== undefined && Math.abs(stats.trend) >= 25) {
+    if (stats != null && stats.trend != null && Math.abs(stats.trend) >= 25) {
       signals.push({
         type: stats.trend > 0 ? 'good' : 'warn',
         label: stats.trend > 0
