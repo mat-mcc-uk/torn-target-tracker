@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Target Tracker
 // @namespace    https://github.com/mat-mcc-uk
-// @version      1.0.0
+// @version      1.0.1
 // @description  Mug target identification and tracking using TornStats spy data
 // @author       mat-mcc-uk
 // @match        https://www.torn.com/*
