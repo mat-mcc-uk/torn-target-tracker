@@ -5,6 +5,8 @@
 // @description  Mug target identification and tracking using TornStats spy data
 // @author       mat-mcc-uk
 // @match        https://www.torn.com/*
+// @updateURL    https://raw.githubusercontent.com/mat-mcc-uk/torn-target-tracker/main/torn-target-tracker.user.js
+// @downloadURL  https://raw.githubusercontent.com/mat-mcc-uk/torn-target-tracker/main/torn-target-tracker.user.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
