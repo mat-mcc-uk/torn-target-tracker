@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Target Tracker
 // @namespace    https://github.com/mat-mcc-uk
-// @version      1.0.1
+// @version      1.0.2
 // @description  Mug target identification and tracking using TornStats spy data
 // @author       mat-mcc-uk
 // @match        https://www.torn.com/*
@@ -130,6 +130,23 @@
       if (changed) saveDB();
       seedFetched = Date.now();
       GM_setValue('ttt_seedFetched', seedFetched);
+
+      // Enrich the most-attacked targets with real profile data (names,
+      // levels) without hammering the API. Limit to 20, one every 700ms.
+      const needProfile = Object.values(targetDB)
+        .filter(t => !t.profileLoaded)
+        .sort((a, b) => b.attacks.length - a.attacks.length)
+        .slice(0, 20);
+      if (needProfile.length) {
+        let delay = 1000;
+        for (const t of needProfile) {
+          setTimeout(async () => {
+            await fetchProfile(t.id);
+            renderList();
+          }, delay);
+          delay += 700;
+        }
+      }
     } catch { /* silent */ }
   }
 
@@ -147,8 +164,9 @@
   function blankTarget(id, name, factionName) {
     return {
       id,
-      name:             name || `Player ${id}`,
+      name:             name || `#${id}`,
       level:            0,
+      profileLoaded:    false,
       factionName:      factionName || '',
       factionId:        0,
       spy:              null,
@@ -157,6 +175,7 @@
       lastActionTs:     0,
       lastActionStatus: 'Unknown',
       status:           'Unknown',
+      statusDescription: '',
       hospitalUntil:    null,
       starred:          false,
       notes:            '',
@@ -185,6 +204,7 @@
       const t = targetDB[id] || (targetDB[id] = blankTarget(id, '', ''));
       t.name             = d.name;
       t.level            = d.level;
+      t.profileLoaded    = true;
       t.factionName      = d.faction?.faction_name || '';
       t.factionId        = d.faction?.faction_id   || 0;
       t.lastActionTs     = d.last_action?.timestamp || 0;
@@ -902,27 +922,38 @@
     const cd   = mugCooldownStr(t);
     const icon = statusIcon(t);
     const sc   = score !== null ? score : '?';
-    const bs   = b    !== null ? b     : '?';
-    const spyLabel = t.spy
-      ? `${formatStats(t.spy.total)} · ${spyAgeStr(t.spy)}`
-      : (b !== null ? `Lv${t.level} est.` : `Lv${t.level || '?'}`);
-    const cash = avgCashStr(t);
     const fact = t.factionName ? ` [${t.factionName.slice(0, 12)}]` : '';
     const chip = topSignalChip(t);
 
+    // Sub-label: spy data, profile level, or loading state
+    let subLabel;
+    if (t.spy) {
+      subLabel = `${formatStats(t.spy.total)} spy · ${spyAgeStr(t.spy)}`;
+    } else if (t.profileLoaded) {
+      subLabel = `Lv${t.level} · no spy data`;
+    } else {
+      subLabel = `Loading profile…`;
+    }
+
+    // Only show cash score when real cash data exists
+    const hasCash = (t.attacks || []).some(a => a.outcome === 'won' && a.cashTaken > 0);
+    const winLabel = b !== null ? `Win:${b}` : 'Win:?';
+    const cashLabel = hasCash ? ` Cash:${c}` : '';
+    const cash = hasCash ? avgCashStr(t) : null;
+
     return `
       <div class="ttt-row" data-tid="${t.id}">
-        <span class="ttt-badge" style="color:${scoreColour(score)}">${sc}</span>
+        <span class="ttt-badge" style="color:${scoreColour(score)}" title="Combined score (win rate × 0.55 + cash likelihood × 0.45)">${sc}</span>
         <span style="font-size:13px">${icon}</span>
         <span class="ttt-row-name">
           ${t.name}${fact}<br>
-          <span class="ttt-sub">${spyLabel}</span>
+          <span class="ttt-sub">${subLabel}</span>
           ${chip ? `<br>${chip}` : ''}
         </span>
         <span class="ttt-row-meta">
           ${cd ? `<span class="ttt-cd">⏱${cd}</span><br>` : ''}
-          <span>B:${bs} C:${c}</span><br>
-          ${cash ? `<span style="color:#9fe8b0">${cash}</span>` : ''}
+          <span style="color:#666">${winLabel}${cashLabel}</span>
+          ${cash ? `<br><span style="color:#9fe8b0">${cash}</span>` : ''}
         </span>
         <button class="ttt-del" data-id="${t.id}" title="Remove target">✕</button>
       </div>
