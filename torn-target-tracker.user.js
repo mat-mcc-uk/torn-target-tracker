@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Target Tracker
 // @namespace    https://github.com/mat-mcc-uk
-// @version      2.0.1
+// @version      2.0.2
 // @description  FFScouter-powered target finder and profile overlay for mugging
 // @author       mat-mcc-uk
 // @match        https://www.torn.com/*
@@ -424,7 +424,17 @@
       ${highDef     ? `<div class="ttt-warn">⚔️ High DEF build — harder to mug</div>` : ''}
 
       <button class="ttt-ov-btn" id="ttt-ov-refresh">↻ Refresh FFS data</button>
-    `;
+
+      ${!ffsKey ? `
+        <hr class="ttt-sep">
+        <div style="font-size:11px;color:#aaa;margin-bottom:4px">Enter your FFScouter key to see stat data:</div>
+        <div style="display:flex;gap:6px;margin-bottom:4px">
+          <input id="ttt-ov-ffs" type="password" placeholder="FFScouter key"
+            style="flex:1;background:#2a2a2a;color:#e0e0e0;border:1px solid #555;border-radius:3px;padding:3px 5px;font-size:11px">
+          <button class="ttt-ov-btn" id="ttt-ov-savekey" style="margin:0">Save</button>
+        </div>
+        <div style="font-size:10px;color:#555">Register free at ffscouter.com then find your key in account settings.</div>
+      ` : ''}`;
 
     document.getElementById('ttt-ov-refresh').addEventListener('click', async () => {
       const btn = document.getElementById('ttt-ov-refresh');
@@ -433,6 +443,21 @@
       document.getElementById('ttt-overlay')?.remove();
       await injectOverlay();
     });
+
+    if (!ffsKey) {
+      document.getElementById('ttt-ov-savekey')?.addEventListener('click', async () => {
+        const val = document.getElementById('ttt-ov-ffs')?.value.trim();
+        if (!val) return;
+        ffsKey = val;
+        GM_setValue('ttt_ffsKey', ffsKey);
+        // Re-render overlay with the new key
+        document.getElementById('ttt-overlay')?.remove();
+        await injectOverlay();
+        // Sync to finder panel input if it exists
+        const finderInput = document.getElementById('ttt-ffs-inp');
+        if (finderInput) finderInput.value = ffsKey;
+      });
+    }
   }
 
   // ---------------------------------------------------------------
@@ -645,10 +670,8 @@
       watchAttackResult();
     }
 
-    // Finder everywhere except profile and attack pages
-    if (!path.includes('profiles.php') && !path.includes('loader.php')) {
-      buildFinder();
-    }
+    // Finder panel on all pages — profile overlay and finder can coexist
+    buildFinder();
   }
 
   // ---------------------------------------------------------------
