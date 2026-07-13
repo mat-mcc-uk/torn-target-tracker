@@ -1,54 +1,43 @@
 // ==UserScript==
 // @name         Torn Target Tracker
 // @namespace    https://github.com/mat-mcc-uk
-// @version      1.0.3
-// @description  Mug target identification and tracking using TornStats spy data
+// @version      2.0.0
+// @description  FFScouter-powered target finder and profile overlay for mugging
 // @author       mat-mcc-uk
 // @match        https://www.torn.com/*
-// @updateURL    https://raw.githubusercontent.com/mat-mcc-uk/torn-target-tracker/main/torn-target-tracker.user.js
-// @downloadURL  https://raw.githubusercontent.com/mat-mcc-uk/torn-target-tracker/main/torn-target-tracker.user.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @connect      api.torn.com
-// @connect      www.tornstats.com
+// @connect      ffscouter.com
+// @updateURL    https://raw.githubusercontent.com/mat-mcc-uk/torn-target-tracker/main/torn-target-tracker.user.js
+// @downloadURL  https://raw.githubusercontent.com/mat-mcc-uk/torn-target-tracker/main/torn-target-tracker.user.js
 // ==/UserScript==
 
 (function () {
   'use strict';
 
   // ---------------------------------------------------------------
+  // Persisted state
+  // ---------------------------------------------------------------
+  let ffsKey         = GM_getValue('ttt_ffsKey',  '');
+  let tornKey        = GM_getValue('ttt_tornKey',  '');
+  let myStats        = GM_getValue('ttt_myStats',  null);
+  let myStatsFetched = GM_getValue('ttt_myStatsFetched', 0);
+  // Cash history keyed by player ID: { wins, losses, records: [{ ts, amount }] }
+  let cashDB         = GM_getValue('ttt_cashDB', {});
+
+  // ---------------------------------------------------------------
   // Constants
   // ---------------------------------------------------------------
-  const MUG_COOLDOWN_MS   = 5 * 60 * 1000;         // 5 minutes between mugs
-  const SPY_CACHE_MS      = 6 * 60 * 60 * 1000;    // re-fetch spy at most every 6h (TS rate limit)
-  const STATS_REFRESH_MS  = 60 * 60 * 1000;        // refresh own stats every hour
-  const SEED_INTERVAL_MS  = 6 * 60 * 60 * 1000;    // re-seed attack log every 6h
-  const MAX_ATTACKS       = 50;                     // attack records kept per target
-  const ROUTE_DEBOUNCE_MS = 350;
+  const STATS_TTL_MS   = 60 * 60 * 1000;  // re-fetch own stats every hour
+  const FFS_TTL_MS     = 10 * 60 * 1000;  // cache per-player FFS response 10m
+  const PROTECT_MS     = 12 * 60 * 60 * 1000;  // mug protection window
+  const MAX_RECORDS    = 30;               // cash records kept per target
 
-  // ---------------------------------------------------------------
-  // State
-  // ---------------------------------------------------------------
-  let tornApiKey     = GM_getValue('ttt_tornKey', '');
-  let tsApiKey       = GM_getValue('ttt_tsKey', '');
-  let myStats        = GM_getValue('ttt_myStats', null);
-  let myStatsFetched = GM_getValue('ttt_myStatsFetched', 0);
-  let targetDB       = GM_getValue('ttt_targetDB', {});
-  let panelPos       = GM_getValue('ttt_panelPos', null);
-  let sortMode       = GM_getValue('ttt_sortMode', 'score');
-  let seedFetched    = GM_getValue('ttt_seedFetched', 0);
-  let dom            = {};
-
-  // ---------------------------------------------------------------
-  // Storage
-  // ---------------------------------------------------------------
-  let dbTimer = null;
-  function saveDB() {
-    clearTimeout(dbTimer);
-    dbTimer = setTimeout(() => GM_setValue('ttt_targetDB', targetDB), 500);
-  }
+  // In-tab FFS response cache so repeated profile visits don't burn requests.
+  const ffsCache = {};
 
   // ---------------------------------------------------------------
   // Network
@@ -58,7 +47,7 @@
       GM_xmlhttpRequest({
         method: 'GET',
         url,
-        timeout: 15000,
+        timeout: 12000,
         onload: (r) => {
           if (r.status >= 200 && r.status < 300) {
             try { resolve(JSON.parse(r.responseText)); }
@@ -73,304 +62,97 @@
     });
   }
 
-  function tornFetch(path, selections) {
-    return gmFetch(`https://api.torn.com/${path}?selections=${selections}&key=${tornApiKey}`);
-  }
-
   // ---------------------------------------------------------------
-  // Own stats
+  // Your own stats (Torn API)
   // ---------------------------------------------------------------
-  async function refreshMyStats(force = false) {
-    if (!tornApiKey) return;
-    if (!force && Date.now() - myStatsFetched < STATS_REFRESH_MS) return;
+  async function getMyStats() {
+    if (myStats && Date.now() - myStatsFetched < STATS_TTL_MS) return myStats;
+    if (!tornKey) return null;
     try {
-      const d = await tornFetch('user/', 'basic,battlestats');
-      if (d.error) return;
+      const d = await gmFetch(
+        `https://api.torn.com/user/?selections=basic,battlestats&key=${tornKey}`
+      );
+      if (d.error) return null;
       myStats = {
-        tornId:     d.player_id,
-        name:       d.name,
-        level:      d.level,
-        strength:   d.strength   || 0,
-        defense:    d.defense    || 0,
-        speed:      d.speed      || 0,
-        dexterity:  d.dexterity  || 0,
-        total:      (d.strength || 0) + (d.defense || 0) + (d.speed || 0) + (d.dexterity || 0),
+        tornId: d.player_id,
+        name:   d.name,
+        level:  d.level,
+        total:  (d.strength || 0) + (d.defense || 0) + (d.speed || 0) + (d.dexterity || 0),
       };
       myStatsFetched = Date.now();
       GM_setValue('ttt_myStats', myStats);
       GM_setValue('ttt_myStatsFetched', myStatsFetched);
-    } catch { /* silent */ }
+      return myStats;
+    } catch { return null; }
   }
 
   // ---------------------------------------------------------------
-  // Attack log seeding
+  // FFScouter — stats for one player
   // ---------------------------------------------------------------
-  async function seedAttackLog() {
-    if (!tornApiKey || !myStats) return;
-    if (Date.now() - seedFetched < SEED_INTERVAL_MS) return;
+  async function getFfsStats(playerId) {
+    const hit = ffsCache[playerId];
+    if (hit && Date.now() - hit.at < FFS_TTL_MS) return hit.data;
+    if (!ffsKey) return null;
     try {
-      const d = await tornFetch('user/', 'attacksfull');
-      if (d.error || !d.attacks) return;
-      let changed = false;
-      for (const atk of Object.values(d.attacks)) {
-        // Only attacks where we were the attacker
-        if (atk.attacker_id !== myStats.tornId) continue;
-        const id = String(atk.defender_id);
-        if (!targetDB[id]) {
-          targetDB[id] = blankTarget(id, atk.defender_name || '', '');
-        }
-        const pushed = pushAttack(id, {
-          ts:            atk.timestamp_ended || atk.timestamp_started,
-          outcome:       normaliseResult(atk.result),
-          cashTaken:     0,      // attacksfull doesn't carry cash — populated from DOM on live hits
-          respectGained: atk.respect || 0,
-        });
-        if (pushed) changed = true;
-      }
-      if (changed) saveDB();
-      seedFetched = Date.now();
-      GM_setValue('ttt_seedFetched', seedFetched);
-
-      // Enrich the most-attacked targets with real profile data (names,
-      // levels) without hammering the API. Limit to 20, one every 700ms.
-      const needProfile = Object.values(targetDB)
-        .filter(t => !t.profileLoaded)
-        .sort((a, b) => b.attacks.length - a.attacks.length)
-        .slice(0, 20);
-      if (needProfile.length) {
-        let delay = 1000;
-        for (const t of needProfile) {
-          setTimeout(async () => {
-            await fetchProfile(t.id);
-            renderList();
-          }, delay);
-          delay += 700;
-        }
-      }
-    } catch { /* silent */ }
-  }
-
-  function normaliseResult(r) {
-    const s = (r || '').toLowerCase();
-    if (['mugged', 'hospitalized', 'attacked'].includes(s)) return 'won';
-    if (s === 'lost') return 'lost';
-    if (s === 'stalemate' || s === 'escape' || s === 'timeout') return 'stalemate';
-    return s;
+      const arr = await gmFetch(
+        `https://ffscouter.com/api/v1/get-stats?key=${ffsKey}&targets=${playerId}`
+      );
+      if (!Array.isArray(arr) || !arr.length) return null;
+      const data = arr[0];
+      if (data.error || data.code) return null;
+      ffsCache[playerId] = { data, at: Date.now() };
+      return data;
+    } catch { return null; }
   }
 
   // ---------------------------------------------------------------
-  // Target helpers
+  // FFScouter — find beatable targets
   // ---------------------------------------------------------------
-  function blankTarget(id, name, factionName) {
+  async function findTargets({ maxFF = 1.5, minLevel = 1, maxLevel = 100 } = {}) {
+    if (!ffsKey) return null;
+    try {
+      return await gmFetch(
+        `https://ffscouter.com/api/v1/get-targets?key=${ffsKey}` +
+        `&minff=1.0&maxff=${maxFF}&minlevel=${minLevel}&maxlevel=${maxLevel}` +
+        `&inactiveonly=0&limit=20`
+      );
+    } catch { return null; }
+  }
+
+  // ---------------------------------------------------------------
+  // Cash history
+  // ---------------------------------------------------------------
+  function recordResult(playerId, outcome, cashTaken) {
+    const id = String(playerId);
+    if (!cashDB[id]) cashDB[id] = { wins: 0, losses: 0, records: [] };
+    const h = cashDB[id];
+    if (outcome === 'won') h.wins++;
+    else if (outcome === 'lost') h.losses++;
+    if (outcome === 'won' && cashTaken > 0) {
+      h.records.unshift({ ts: Date.now(), amount: cashTaken });
+      if (h.records.length > MAX_RECORDS) h.records.length = MAX_RECORDS;
+    }
+    GM_setValue('ttt_cashDB', cashDB);
+  }
+
+  function cashSummary(playerId) {
+    const h = cashDB[String(playerId)];
+    if (!h) return null;
+    const cashRecords = h.records.filter(r => r.amount > 0);
+    const avg = cashRecords.length
+      ? cashRecords.reduce((a, b) => a + b.amount, 0) / cashRecords.length
+      : null;
     return {
-      id,
-      name:             name || `#${id}`,
-      level:            0,
-      profileLoaded:    false,
-      profileFetchedAt: 0,
-      factionName:      factionName || '',
-      factionId:        0,
-      spy:              null,
-      spyFetchedAt:     0,
-      attacks:          [],
-      lastActionTs:     0,
-      lastActionStatus: 'Unknown',
-      status:           'Unknown',
-      statusDescription: '',
-      hospitalUntil:    null,
-      starred:          false,
-      notes:            '',
-      addedAt:          Date.now(),
-    };
-  }
-
-  // Returns true if the record was new and inserted.
-  function pushAttack(id, record) {
-    const t = targetDB[id];
-    if (!t) return false;
-    if (t.attacks.some(a => a.ts === record.ts)) return false;
-    t.attacks.unshift(record);
-    if (t.attacks.length > MAX_ATTACKS) t.attacks.length = MAX_ATTACKS;
-    return true;
-  }
-
-  // ---------------------------------------------------------------
-  // Profile fetch
-  // ---------------------------------------------------------------
-  async function fetchProfile(id) {
-    if (!tornApiKey) return;
-    try {
-      const d = await tornFetch(`user/${id}`, 'profile');
-      if (d.error) return;
-      const t = targetDB[id] || (targetDB[id] = blankTarget(id, '', ''));
-      t.name             = d.name;
-      t.level            = d.level;
-      t.profileLoaded    = true;
-      t.profileFetchedAt = Date.now();
-      t.factionName      = d.faction?.faction_name || '';
-      t.factionId        = d.faction?.faction_id   || 0;
-      t.lastActionTs     = d.last_action?.timestamp || 0;
-      t.lastActionStatus = d.last_action?.status    || 'Unknown';
-      t.status           = d.status?.state          || 'Unknown';
-      t.statusDescription = d.status?.description   || '';
-      t.hospitalUntil    = d.status?.until          || null;
-      saveDB();
-    } catch { /* silent */ }
-  }
-
-  // ---------------------------------------------------------------
-  // TornStats spy fetch
-  // ---------------------------------------------------------------
-  async function fetchSpy(id, force = false) {
-    if (!tsApiKey) return null;
-    const t = targetDB[id];
-    if (!t) return null;
-    if (!force && t.spyFetchedAt && Date.now() - t.spyFetchedAt < SPY_CACHE_MS) return t.spy;
-    try {
-      const d = await gmFetch(`https://www.tornstats.com/api/v1/${tsApiKey}/spy/user/${id}`);
-      t.spyFetchedAt = Date.now();
-      const spy = d?.spy;
-      if (!spy || !spy.status || !(spy.total > 0)) {
-        t.spy = null;
-      } else {
-        t.spy = {
-          strength:  spy.strength  || 0,
-          defense:   spy.defense   || 0,
-          speed:     spy.speed     || 0,
-          dexterity: spy.dexterity || 0,
-          total:     spy.total     || 0,
-          // TornStats returns age as a human string: "18 hours ago", "3 days ago"
-          timestamp: parseSpyAge(spy.difference),
-        };
-      }
-      saveDB();
-      return t.spy;
-    } catch {
-      return null;
-    }
-  }
-
-  function parseSpyAge(str) {
-    const now = Date.now() / 1000;
-    if (!str) return now;
-    const m = str.match(/(\d+)\s+(minute|hour|day|week|month)/);
-    if (!m) return now;
-    const n = parseInt(m[1]);
-    const u = m[2];
-    const secs = { minute: 60, hour: 3600, day: 86400, week: 604800, month: 2592000 };
-    return now - n * (secs[u] || 0);
-  }
-
-  // ---------------------------------------------------------------
-  // Scoring
-  // ---------------------------------------------------------------
-  function beatableScore(t) {
-    const spy     = t.spy;
-    const attacks = t.attacks || [];
-    const wins    = attacks.filter(a => a.outcome === 'won').length;
-    const total   = attacks.length;
-
-    // Real spy data path
-    if (spy && spy.total > 0 && myStats?.total > 0) {
-      const ratio = myStats.total / spy.total;
-      let score =
-        ratio >= 3.0 ? 97 :
-        ratio >= 2.0 ? 88 :
-        ratio >= 1.4 ? 75 :
-        ratio >= 1.1 ? 60 :
-        ratio >= 0.9 ? 45 :
-        ratio >= 0.7 ? 28 : 12;
-
-      // Discount stale spy data
-      const ageDays = (Date.now() / 1000 - spy.timestamp) / 86400;
-      if (ageDays > 60) score = Math.round(score * 0.6);
-      else if (ageDays > 30) score = Math.round(score * 0.78);
-      else if (ageDays > 14) score = Math.round(score * 0.9);
-
-      // Blend with actual win rate when we have enough fights
-      if (total >= 5) {
-        score = Math.round(score * 0.55 + (wins / total) * 100 * 0.45);
-      }
-      return clamp(score, 0, 100);
-    }
-
-    // Win rate from fight history (3+ fights)
-    if (total >= 3) return Math.round((wins / total) * 100);
-
-    // Level proxy — labelled as estimate in the UI
-    if (myStats?.level && t.level > 0) {
-      const lr = myStats.level / t.level;
-      return lr >= 1.5 ? 72 : lr >= 1.0 ? 55 : lr >= 0.8 ? 40 : 25;
-    }
-
-    return null; // genuinely unknown
-  }
-
-  function cashScore(t) {
-    let score = 0;
-
-    // Level base: cap at 20 points
-    score += Math.min(20, (t.level || 1) * 0.28);
-
-    // Cash history: average taken, capped at 45 points ($5M = full)
-    const cashHits = (t.attacks || [])
-      .filter(a => a.outcome === 'won' && a.cashTaken > 0)
-      .map(a => a.cashTaken);
-    if (cashHits.length > 0) {
-      const avg = cashHits.reduce((a, b) => a + b, 0) / cashHits.length;
-      score += Math.min(45, avg / 111111);
-    }
-
-    // Activity recency: up to 10 points
-    const ageMs = Date.now() - (t.lastActionTs || 0) * 1000;
-    if (ageMs < 3_600_000)   score += 10;
-    else if (ageMs < 14_400_000) score += 4;
-
-    // Returning traveller: strong signal. Torn players often carry cash from
-    // selling items abroad, and can't bank until they land.
-    if (t.status === 'Traveling' && /torn/i.test(t.statusDescription || '')) {
-      score += 25;
-    }
-
-    // Hospital: can't bank while inside (base bonus).
-    if (t.status === 'Hospital') {
-      score += 8;
-      // Releasing soon: they've been sitting with wallet cash; worth hitting
-      // shortly after release before they bank.
-      if (t.hospitalUntil) {
-        const minsUntilRelease = (t.hospitalUntil * 1000 - Date.now()) / 60000;
-        if (minsUntilRelease > 0 && minsUntilRelease < 60) score += 7;
-      }
-    }
-
-    // Mug protection penalty: our last successful hit started a 12h protection
-    // window. Only the unprotected portion above the previous mug amount is
-    // accessible. Flag this so the score reflects reality.
-    const lastWin = (t.attacks || []).find(a => a.outcome === 'won' && a.cashTaken > 0);
-    if (lastWin) {
-      const protExpiry = lastWin.ts * 1000 + 12 * 60 * 60 * 1000;
-      if (protExpiry > Date.now()) score = Math.round(score * 0.25);
-    }
-
-    return clamp(Math.round(score), 0, 100);
-  }
-
-  function combinedScore(t) {
-    const b = beatableScore(t);
-    const c = cashScore(t);
-    return {
-      b,
-      c,
-      score: b !== null ? Math.round(b * 0.55 + c * 0.45) : null,
+      wins: h.wins, losses: h.losses,
+      avg, samples: cashRecords.length,
+      lastHitTs: cashRecords[0]?.ts || null,
     };
   }
 
   // ---------------------------------------------------------------
-  // Helpers
+  // Formatting
   // ---------------------------------------------------------------
-  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-
-  function formatCash(n) {
+  function fmtCash(n) {
     if (!n) return '$0';
     if (n >= 1e9) return '$' + (n / 1e9).toFixed(1) + 'B';
     if (n >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
@@ -378,222 +160,106 @@
     return '$' + n;
   }
 
-  function formatStats(n) {
-    if (!n) return '?';
-    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-    if (n >= 1e3) return Math.round(n / 1e3) + 'k';
-    return String(n);
+  function fmtAge(ts) {
+    const m = Math.round((Date.now() - ts) / 60000);
+    if (m < 60)   return m + 'm ago';
+    if (m < 1440) return Math.round(m / 60) + 'h ago';
+    return Math.round(m / 1440) + 'd ago';
   }
 
-  function scoreColour(s) {
-    if (s === null || s === undefined) return '#888';
-    if (s >= 70) return '#9fe8b0';
-    if (s >= 45) return '#f0d27a';
-    return '#f0a0a0';
+  // Fair fight verdict. Lower FF = you outclass them.
+  function ffVerdict(ff) {
+    if (ff === null || ff === undefined) return { text: 'No data', colour: '#888' };
+    if (ff < 1.3) return { text: 'Easy win',    colour: '#9fe8b0' };
+    if (ff < 1.8) return { text: 'Manageable',  colour: '#9fe8b0' };
+    if (ff < 2.5) return { text: 'Risky',       colour: '#f0d27a' };
+    return               { text: 'Avoid',        colour: '#f0a0a0' };
   }
 
-  function statusIcon(t) {
-    const STATUS_STALE_MS = 15 * 60 * 1000;
-    const isStale = t.profileFetchedAt && Date.now() - t.profileFetchedAt > STATUS_STALE_MS;
+  // ---------------------------------------------------------------
+  // Profile page DOM — read live data without an API call
+  // ---------------------------------------------------------------
+  function readProfileDom() {
+    // Name: usually in the page title "PlayerName [ID] - Torn"
+    let name = null;
+    const titleM = document.title.match(/^(.+?)\s*\[/);
+    if (titleM) name = titleM[1].trim();
 
-    if (t.status === 'Hospital') return isStale ? '⚪' : '🔴';
-    if (t.status === 'Traveling') return isStale ? '⚪' : '✈️';
-    if (t.status === 'Jail' || t.status === 'Federal') return isStale ? '⚪' : '🔒';
-    if (t.lastActionStatus === 'Online') return '🟢';
-    if (t.lastActionStatus === 'Idle') return '🟡';
-    return '⚫';
-  }
-
-  function mugCooldownStr(t) {
-    const last = (t.attacks || [])[0];
-    if (!last) return null;
-    const elapsed = Date.now() - last.ts * 1000;
-    if (elapsed >= MUG_COOLDOWN_MS) return null;
-    const rem = MUG_COOLDOWN_MS - elapsed;
-    const m = Math.floor(rem / 60000);
-    const s = Math.floor((rem % 60000) / 1000);
-    return `${m}:${String(s).padStart(2, '0')}`;
-  }
-
-  function spyAgeStr(spy) {
-    if (!spy) return 'No spy';
-    const days = (Date.now() / 1000 - spy.timestamp) / 86400;
-    if (days < 1)  return 'Today';
-    if (days < 2)  return '1d old';
-    if (days < 7)  return `${Math.floor(days)}d old`;
-    if (days < 30) return `${Math.floor(days / 7)}wk old`;
-    return `${Math.floor(days / 30)}mo old`;
-  }
-
-  function avgCashStr(t) {
-    const hits = (t.attacks || []).filter(a => a.outcome === 'won' && a.cashTaken > 0);
-    if (!hits.length) return null;
-    const avg = hits.reduce((a, b) => a + b.cashTaken, 0) / hits.length;
-    return formatCash(avg) + ` avg (${hits.length})`;
-  }
-
-  // Variance and trend for cash history. Returns null when insufficient data.
-  function cashStats(t) {
-    const hits = (t.attacks || [])
-      .filter(a => a.outcome === 'won' && a.cashTaken > 0)
-      .map(a => a.cashTaken);
-    if (hits.length < 2) return null;
-    const avg = hits.reduce((a, b) => a + b, 0) / hits.length;
-    const stdDev = Math.sqrt(hits.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / hits.length);
-    const cv = stdDev / avg; // coefficient of variation: low = consistent, high = erratic
-    let trend = null;
-    if (hits.length >= 4) {
-      const recentAvg = hits.slice(0, 3).reduce((a, b) => a + b, 0) / 3;
-      const olderAvg  = hits.slice(3).reduce((a, b) => a + b, 0) / (hits.length - 3);
-      if (olderAvg > 0) trend = Math.round(((recentAvg - olderAvg) / olderAvg) * 100);
-    }
-    return { avg, stdDev, cv, trend };
-  }
-
-  // Returns an array of { type, label, detail } objects representing signals
-  // about whether this target is likely carrying significant cash right now.
-  //   type: 'good' | 'warn' | 'bad' | 'info'
-  function walletSignals(t) {
-    const signals = [];
-
-    // Returning traveller — strongest positive signal.
-    if (t.status === 'Traveling' && /torn/i.test(t.statusDescription || '')) {
-      const landMs = t.hospitalUntil ? t.hospitalUntil * 1000 : null;
-      const detail = landMs
-        ? `lands in ~${Math.max(1, Math.ceil((landMs - Date.now()) / 60000))}m`
-        : 'in transit to Torn';
-      signals.push({ type: 'good', label: '✈️ Returning to Torn', detail });
+    // Level: Torn renders it inside a specific wrapper
+    let level = null;
+    for (const sel of ['.level-wrap .value', '.basic-information .level', '[class*="level"] .value']) {
+      const el = document.querySelector(sel);
+      if (el) { level = parseInt(el.textContent) || null; break; }
     }
 
-    // Mug protection — strongest negative signal.
-    const lastWin = (t.attacks || []).find(a => a.outcome === 'won' && a.cashTaken > 0);
-    if (lastWin) {
-      const protExpiry = lastWin.ts * 1000 + 12 * 60 * 60 * 1000;
-      const minsLeft = (protExpiry - Date.now()) / 60000;
-      if (minsLeft > 0) {
-        signals.push({
-          type: 'bad',
-          label: '🛡 Mug protection active',
-          detail: `we hit them ${Math.ceil((Date.now() - lastWin.ts * 1000) / 60000)}m ago — expires in ${Math.ceil(minsLeft)}m`,
-        });
-      }
+    // Status: "Okay", "In hospital", "Traveling" etc.
+    let status = null;
+    for (const sel of ['.status-wrap', '[class*="status"] .value', '.profile-status']) {
+      const el = document.querySelector(sel);
+      if (el) { status = el.textContent.trim(); break; }
     }
 
-    // Hospital status with release timing. Skip entirely if profile data is
-    // stale — the hospital window may have already passed.
-    const STATUS_STALE_MS = 15 * 60 * 1000;
-    const statusFresh = !t.profileFetchedAt || Date.now() - t.profileFetchedAt < STATUS_STALE_MS;
-    if (t.status === 'Hospital' && statusFresh) {
-      if (t.hospitalUntil) {
-        const minsLeft = Math.max(0, (t.hospitalUntil * 1000 - Date.now()) / 60000);
-        if (minsLeft < 60) {
-          signals.push({
-            type: 'good',
-            label: `🏥 Releasing in ~${Math.ceil(minsLeft)}m`,
-            detail: 'cannot bank while inside — hit after release',
-          });
-        } else {
-          signals.push({
-            type: 'info',
-            label: '🏥 In hospital',
-            detail: `${Math.ceil(minsLeft)}m remaining — cannot bank`,
-          });
-        }
-      } else {
-        signals.push({ type: 'info', label: '🏥 In hospital', detail: 'cannot bank' });
-      }
-    } else if (t.status === 'Hospital' && !statusFresh) {
-      signals.push({
-        type: 'warn',
-        label: '🏥 Was in hospital',
-        detail: 'status may be outdated — tap Refresh Status',
-      });
-    }
-
-    // Cash consistency (requires 3+ wins with cash recorded).
-    const stats = cashStats(t);
-    if (stats) {
-      if (stats.cv < 0.3) {
-        signals.push({
-          type: 'good',
-          label: '💰 Consistent carrier',
-          detail: `avg ${formatCash(stats.avg)} ±${formatCash(stats.stdDev)}`,
-        });
-      } else if (stats.cv > 0.8) {
-        signals.push({
-          type: 'warn',
-          label: '🎲 Erratic — high variance',
-          detail: `avg ${formatCash(stats.avg)} ±${formatCash(stats.stdDev)}`,
-        });
-      }
-    }
-
-    // Cash trend (requires 4+ wins to compare recent vs older).
-    if (stats != null && stats.trend != null && Math.abs(stats.trend) >= 25) {
-      signals.push({
-        type: stats.trend > 0 ? 'good' : 'warn',
-        label: stats.trend > 0
-          ? `📈 Cash up ${stats.trend}% recently`
-          : `📉 Cash down ${Math.abs(stats.trend)}% recently`,
-        detail: 'comparing last 3 hits to older history',
-      });
-    }
-
-    // Low yield warning — likely 7★ clothing.
-    if (stats && stats.avg < 200000 && (t.level || 0) > 30) {
-      signals.push({
-        type: 'bad',
-        label: '⚠️ Low yield — likely 7★ clothing',
-        detail: '75% mug reduction active — probably not worth the energy',
-      });
-    }
-
-    // Online/recently active (positive if no other strong signals).
-    const ageMs = Date.now() - (t.lastActionTs || 0) * 1000;
-    if (ageMs < 1_800_000 && t.status !== 'Hospital') {
-      signals.push({
-        type: 'info',
-        label: '🟢 Active in last 30m',
-        detail: 'likely doing crimes or trading',
-      });
-    }
-
-    return signals;
-  }
-
-  // Single-line compact summary for the panel list row. Shows the most
-  // important signal only so rows stay scannable.
-  function topSignalChip(t) {
-    const sigs = walletSignals(t);
-    if (!sigs.length) return '';
-    // Priority order: bad signals first (protection), then good (returning), then info
-    const priority = ['bad', 'good', 'warn', 'info'];
-    const top = priority.reduce((found, type) => found || sigs.find(s => s.type === type), null);
-    if (!top) return '';
-    const colour = { good: '#9fe8b0', warn: '#f0d27a', bad: '#f0a0a0', info: '#888' }[top.type];
-    return `<span style="color:${colour};font-size:10px">${top.label}</span>`;
-  }
-
-  function fightRecordStr(t) {
-    const atks = t.attacks || [];
-    if (!atks.length) return 'No history';
-    const w = atks.filter(a => a.outcome === 'won').length;
-    const l = atks.filter(a => a.outcome === 'lost').length;
-    return `${w}W / ${l}L`;
+    return { name, level, status };
   }
 
   // ---------------------------------------------------------------
   // CSS
   // ---------------------------------------------------------------
   GM_addStyle(`
-    #ttt-panel {
+    #ttt-overlay {
+      background: #1b1b1b;
+      border: 1px solid #444;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin: 8px 0;
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      color: #e0e0e0;
+      max-width: 520px;
+    }
+    .ttt-ov-hdr {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 11px;
+      font-weight: bold;
+      color: #aaa;
+    }
+    .ttt-ov-verdict {
+      font-size: 13px;
+      font-weight: bold;
+      padding: 4px 12px;
+      border-radius: 4px;
+      background: #2a2a2a;
+      margin-bottom: 8px;
+      display: inline-block;
+    }
+    .ttt-ov-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    .ttt-ov-lbl { color: #888; }
+    .ttt-ov-val { font-weight: bold; }
+    .ttt-sep { border: none; border-top: 1px solid #333; margin: 7px 0; }
+    .ttt-warn { color: #f0d27a; font-size: 10px; margin-top: 3px; }
+    .ttt-bad  { color: #f0a0a0; font-size: 10px; margin-top: 3px; }
+    .ttt-ov-btn {
+      background: #2a2a2a; color: #e0e0e0;
+      border: 1px solid #555; border-radius: 3px;
+      padding: 3px 8px; cursor: pointer; font-size: 11px;
+      margin-top: 8px;
+    }
+    .ttt-ov-btn:hover { background: #333; }
+
+    /* Target finder */
+    #ttt-finder {
       position: fixed;
-      bottom: 110px;
-      right: 10px;
-      width: 370px;
+      bottom: 110px; right: 10px;
+      width: 350px;
       max-width: calc(100vw - 20px);
-      max-height: 75vh;
+      max-height: 70vh;
       overflow-y: auto;
       background: #1b1b1b;
       color: #e0e0e0;
@@ -604,413 +270,71 @@
       z-index: 9998;
       box-shadow: 0 2px 10px rgba(0,0,0,0.5);
     }
-    #ttt-panel.ttt-col .ttt-body,
-    #ttt-panel.ttt-col .ttt-settings { display: none !important; }
-    #ttt-panel h3 {
+    #ttt-finder.ttt-col .ttt-fb { display: none; }
+    #ttt-finder h3 {
       margin: 0; padding: 8px 10px;
       background: #2a2a2a; border-bottom: 1px solid #444;
-      cursor: move; touch-action: none;
+      cursor: pointer; user-select: none;
       display: flex; justify-content: space-between; align-items: center;
-      user-select: none; font-size: 13px;
+      font-size: 12px;
     }
-    #ttt-panel.ttt-drag { box-shadow: 0 4px 20px rgba(240,160,100,0.35); opacity: 0.95; }
-    .ttt-body { padding: 8px 10px; }
-    .ttt-settings {
-      padding: 8px 10px; border-bottom: 1px solid #333;
-      display: none; font-size: 11px;
+    .ttt-fb { padding: 8px 10px; }
+    .ttt-controls {
+      display: flex; gap: 5px; align-items: center;
+      flex-wrap: wrap; margin-bottom: 8px; font-size: 11px;
     }
-    .ttt-settings label { display: block; color: #aaa; margin-bottom: 3px; }
-    .ttt-settings input, .ttt-settings select {
+    .ttt-controls input {
       background: #2a2a2a; color: #e0e0e0;
-      border: 1px solid #555; border-radius: 3px; padding: 3px 5px;
-    }
-    .ttt-settings input[type=password], .ttt-settings input[type=text] {
-      width: 100%; box-sizing: border-box; margin-bottom: 6px;
-    }
-    .ttt-btn {
-      background: #333; color: #e0e0e0;
       border: 1px solid #555; border-radius: 3px;
-      padding: 3px 8px; cursor: pointer; font-size: 11px;
+      padding: 2px 4px;
     }
-    .ttt-btn:hover { background: #444; }
-    .ttt-btn.ttt-green { background: #1e5631; color: #9fe8b0; border-color: #2d7d47; }
-    .ttt-btn.ttt-red { background: #4a2424; color: #f0a0a0; border-color: #7a3838; }
-    .ttt-icon-btn {
-      background: none; border: none; color: #e0e0e0;
-      cursor: pointer; font-size: 13px; padding: 0 2px;
+    .ttt-find-btn {
+      background: #1e5631; color: #9fe8b0;
+      border: 1px solid #2d7d47; border-radius: 3px;
+      padding: 3px 10px; cursor: pointer; font-size: 11px;
     }
-    .ttt-add-row { display: flex; gap: 6px; margin-bottom: 8px; }
-    .ttt-add-row input {
-      width: 90px; background: #2a2a2a; color: #e0e0e0;
-      border: 1px solid #555; border-radius: 3px; padding: 3px 5px;
-      font-size: 11px;
-    }
-    .ttt-row {
-      display: flex; align-items: center; gap: 6px;
+    .ttt-find-btn:disabled { opacity: 0.5; cursor: default; }
+    .ttt-t-row {
+      display: flex; align-items: center; gap: 7px;
       padding: 5px 0; border-bottom: 1px solid #222; cursor: pointer;
     }
-    .ttt-row:hover { background: #212121; }
-    .ttt-badge {
-      min-width: 28px; text-align: center; font-weight: bold;
+    .ttt-t-row:hover { background: #212121; }
+    .ttt-ff-pill {
+      min-width: 36px; text-align: center; font-weight: bold;
       font-size: 11px; padding: 2px 4px; border-radius: 3px;
       background: #2a2a2a; flex-shrink: 0;
     }
-    .ttt-row-name { flex: 1; font-size: 11px; overflow: hidden; }
-    .ttt-row-name .ttt-sub { color: #666; font-size: 10px; }
-    .ttt-row-meta { text-align: right; font-size: 10px; color: #888; flex-shrink: 0; }
-    .ttt-cd { color: #f0d27a; }
-    .ttt-empty { color: #666; text-align: center; padding: 18px 0; font-size: 11px; }
-    .ttt-del { background: none; border: none; color: #555; cursor: pointer; font-size: 11px; padding: 0 2px; }
-    .ttt-del:hover { color: #f0a0a0; }
-
-    /* Profile page overlay */
-    #ttt-overlay {
-      background: #1b1b1b; border: 1px solid #444; border-radius: 6px;
-      padding: 10px 12px; margin: 10px 0;
-      font-family: Arial, sans-serif; font-size: 12px; color: #e0e0e0;
+    .ttt-t-name { font-size: 12px; }
+    .ttt-t-sub  { font-size: 10px; color: #666; }
+    .ttt-settings-panel {
+      border-top: 1px solid #333;
+      padding-top: 8px; margin-top: 8px; font-size: 11px;
     }
-    #ttt-overlay .ttt-ov-h { font-weight: bold; color: #aaa; font-size: 11px; margin-bottom: 8px; }
-    #ttt-overlay .ttt-ov-r { display: flex; justify-content: space-between; margin-bottom: 4px; }
-    #ttt-overlay .ttt-ov-l { color: #888; }
-    #ttt-overlay .ttt-ov-v { font-weight: bold; }
-    #ttt-overlay .ttt-ov-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+    .ttt-settings-panel label { display: block; color: #aaa; margin-bottom: 2px; }
+    .ttt-settings-panel input {
+      background: #2a2a2a; color: #e0e0e0;
+      border: 1px solid #555; border-radius: 3px;
+      padding: 3px 5px; width: 100%; box-sizing: border-box; margin-bottom: 6px;
+    }
+    .ttt-icon-btn {
+      background: none; border: none;
+      color: #e0e0e0; cursor: pointer; font-size: 13px; padding: 0 2px;
+    }
+    .ttt-empty { color: #666; text-align: center; padding: 16px; font-size: 11px; }
   `);
 
   // ---------------------------------------------------------------
-  // Home panel
-  // ---------------------------------------------------------------
-  function ensurePanel() {
-    if (document.getElementById('ttt-panel')) return;
-
-    const panel = document.createElement('div');
-    panel.id = 'ttt-panel';
-    panel.classList.add('ttt-col');
-    panel.innerHTML = `
-      <h3>
-        <span>🎯 Target Tracker</span>
-        <span style="display:flex;gap:4px;align-items:center">
-          <button class="ttt-icon-btn" id="ttt-gear" title="Settings">⚙</button>
-          <button class="ttt-icon-btn" id="ttt-tog">▲</button>
-        </span>
-      </h3>
-      <div class="ttt-settings" id="ttt-settings">
-        <label>Torn API key (Limited Access minimum)</label>
-        <input id="ttt-tk" type="password" value="${tornApiKey}" placeholder="16-char key">
-        <label>TornStats API key</label>
-        <input id="ttt-sk" type="password" value="${tsApiKey}" placeholder="TornStats key">
-        <div style="display:flex;gap:6px;margin-bottom:8px">
-          <button class="ttt-btn" id="ttt-save-keys">Save keys</button>
-          <button class="ttt-btn" id="ttt-reseed">↻ Re-seed log</button>
-        </div>
-        <div style="display:flex;gap:6px;margin-bottom:4px">
-          <select class="ttt-btn" id="ttt-sort" style="flex:1">
-            <option value="score"  ${sortMode==='score' ?'selected':''}>Sort: Overall</option>
-            <option value="beat"   ${sortMode==='beat'  ?'selected':''}>Sort: Beatable</option>
-            <option value="cash"   ${sortMode==='cash'  ?'selected':''}>Sort: Cash score</option>
-            <option value="recent" ${sortMode==='recent'?'selected':''}>Sort: Recent</option>
-          </select>
-          <button class="ttt-btn" id="ttt-refresh-all" title="Refresh all profiles">↻ All</button>
-        </div>
-        <div style="display:flex;gap:6px">
-          <button class="ttt-btn ttt-red" id="ttt-clear">Clear all targets</button>
-          <button class="ttt-btn" id="ttt-reset-pos">Reset position</button>
-        </div>
-      </div>
-      <div class="ttt-body">
-        <div class="ttt-add-row">
-          <input id="ttt-add-id" type="number" placeholder="Player ID">
-          <button class="ttt-btn ttt-green" id="ttt-add">+ Add</button>
-        </div>
-        <div id="ttt-list"></div>
-      </div>
-    `;
-    document.body.appendChild(panel);
-    if (panelPos) applyPos(panel, panelPos);
-
-    dom.list = document.getElementById('ttt-list');
-
-    wirePanelHandlers(panel);
-    renderList();
-    setInterval(() => {
-      if (!panel.classList.contains('ttt-col')) tickCooldowns();
-    }, 1000);
-  }
-
-  function wirePanelHandlers(panel) {
-    // Drag
-    const hdr = panel.querySelector('h3');
-    let drag = null;
-    hdr.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('button')) return;
-      const r = panel.getBoundingClientRect();
-      drag = { sx: e.clientX, sy: e.clientY, pl: r.left, pt: r.top, moved: false, pid: e.pointerId };
-      try { hdr.setPointerCapture(e.pointerId); } catch {}
-    });
-    hdr.addEventListener('pointermove', (e) => {
-      if (!drag || e.pointerId !== drag.pid) return;
-      const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
-      if (!drag.moved && Math.hypot(dx, dy) < 5) return;
-      drag.moved = true;
-      panel.classList.add('ttt-drag');
-      applyPos(panel, { left: drag.pl + dx, top: drag.pt + dy });
-      e.preventDefault();
-    });
-    function endDrag(e) {
-      if (!drag || e.pointerId !== drag.pid) return;
-      const wasDrag = drag.moved, r = panel.getBoundingClientRect();
-      try { hdr.releasePointerCapture(e.pointerId); } catch {}
-      drag = null;
-      panel.classList.remove('ttt-drag');
-      if (wasDrag) {
-        panelPos = { left: r.left, top: r.top };
-        GM_setValue('ttt_panelPos', panelPos);
-      } else {
-        togglePanel(panel);
-      }
-    }
-    hdr.addEventListener('pointerup', endDrag);
-    hdr.addEventListener('pointercancel', endDrag);
-
-    // Collapse button
-    const tog = document.getElementById('ttt-tog');
-    tog.addEventListener('pointerdown', (e) => e.stopPropagation());
-    tog.addEventListener('click', (e) => { e.stopPropagation(); togglePanel(panel); });
-
-    // Gear
-    document.getElementById('ttt-gear').addEventListener('click', (e) => {
-      e.stopPropagation();
-      const s = document.getElementById('ttt-settings');
-      s.style.display = s.style.display === 'block' ? 'none' : 'block';
-    });
-
-    // Save keys
-    document.getElementById('ttt-save-keys').addEventListener('click', async () => {
-      const btn = document.getElementById('ttt-save-keys');
-      const tk = document.getElementById('ttt-tk').value.trim();
-      const sk = document.getElementById('ttt-sk').value.trim();
-      if (tk && tk !== tornApiKey) {
-        btn.textContent = 'Verifying...';
-        try {
-          const d = await gmFetch(`https://api.torn.com/user/?selections=basic&key=${tk}`);
-          if (d.error) { alert('Torn rejected that key: ' + d.error.error); btn.textContent = 'Save keys'; return; }
-        } catch { alert('Could not reach Torn API.'); btn.textContent = 'Save keys'; return; }
-      }
-      tornApiKey = tk; tsApiKey = sk;
-      GM_setValue('ttt_tornKey', tornApiKey);
-      GM_setValue('ttt_tsKey', tsApiKey);
-      btn.textContent = 'Saved ✓';
-      setTimeout(() => { btn.textContent = 'Save keys'; }, 2000);
-      myStatsFetched = 0;
-      await refreshMyStats(true);
-    });
-
-    // Re-seed
-    document.getElementById('ttt-reseed').addEventListener('click', async () => {
-      seedFetched = 0;
-      await seedAttackLog();
-      renderList();
-    });
-
-    // Sort
-    document.getElementById('ttt-sort').addEventListener('change', (e) => {
-      sortMode = e.target.value;
-      GM_setValue('ttt_sortMode', sortMode);
-      renderList();
-    });
-
-    // Refresh all profiles
-    document.getElementById('ttt-refresh-all').addEventListener('click', async () => {
-      const btn = document.getElementById('ttt-refresh-all');
-      btn.textContent = '…';
-      for (const id of Object.keys(targetDB)) {
-        await fetchProfile(id);
-        await new Promise(r => setTimeout(r, 600));
-      }
-      btn.textContent = '↻ All';
-      renderList();
-    });
-
-    // Clear all
-    document.getElementById('ttt-clear').addEventListener('click', () => {
-      if (!confirm('Remove all targets? Attack history will be lost.')) return;
-      targetDB = {};
-      GM_setValue('ttt_targetDB', {});
-      renderList();
-    });
-
-    // Reset position
-    document.getElementById('ttt-reset-pos').addEventListener('click', () => {
-      panelPos = null;
-      GM_setValue('ttt_panelPos', null);
-      applyPos(panel, null);
-    });
-
-    // Add target
-    const addId = document.getElementById('ttt-add-id');
-    document.getElementById('ttt-add').addEventListener('click', async () => {
-      const id = String(addId.value.trim());
-      if (!id || isNaN(id)) return;
-      addId.value = '';
-      if (!targetDB[id]) targetDB[id] = blankTarget(id, '', '');
-      saveDB();
-      renderList();
-      await fetchProfile(id);
-      await fetchSpy(id);
-      renderList();
-    });
-    addId.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') document.getElementById('ttt-add').click();
-    });
-
-    // List delegation
-    document.getElementById('ttt-list').addEventListener('click', (e) => {
-      const del = e.target.closest('.ttt-del');
-      if (del) {
-        const id = del.dataset.id;
-        if (confirm(`Remove ${targetDB[id]?.name || id}?`)) {
-          delete targetDB[id];
-          saveDB();
-          renderList();
-        }
-        return;
-      }
-      const row = e.target.closest('[data-tid]');
-      if (row) window.open(`/profiles.php?XID=${row.dataset.tid}`, '_self');
-    });
-
-    window.addEventListener('resize', () => {
-      if (panelPos) applyPos(panel, panelPos);
-    });
-  }
-
-  function togglePanel(panel) {
-    panel.classList.toggle('ttt-col');
-    const col = panel.classList.contains('ttt-col');
-    document.getElementById('ttt-tog').textContent = col ? '▲' : '▼';
-    if (!col) renderList();
-  }
-
-  function applyPos(panel, pos) {
-    if (!pos) {
-      panel.style.cssText = panel.style.cssText
-        .replace(/left:[^;]+;?/g, '')
-        .replace(/top:[^;]+;?/g, '');
-      panel.style.right = ''; panel.style.bottom = '';
-      return;
-    }
-    const r = panel.getBoundingClientRect();
-    const w = r.width || 370, M = 40;
-    const cl = clamp(pos.left, M - w, window.innerWidth - M);
-    const ct = clamp(pos.top,  0,      window.innerHeight - M);
-    panel.style.left = cl + 'px'; panel.style.top = ct + 'px';
-    panel.style.right = 'auto'; panel.style.bottom = 'auto';
-  }
-
-  function renderList() {
-    if (!dom.list) return;
-    const targets = Object.values(targetDB);
-    if (!targets.length) {
-      dom.list.innerHTML = '<div class="ttt-empty">No targets yet.<br>Add a player ID above or visit any profile.</div>';
-      return;
-    }
-
-    // Sort
-    targets.sort((a, b) => {
-      const ca = combinedScore(a), cb = combinedScore(b);
-      if (sortMode === 'score')  return (cb.score || 0) - (ca.score || 0);
-      if (sortMode === 'beat')   return (cb.b || 0) - (ca.b || 0);
-      if (sortMode === 'cash')   return cb.c - ca.c;
-      if (sortMode === 'recent') {
-        const ra = a.attacks[0]?.ts || a.addedAt / 1000;
-        const rb = b.attacks[0]?.ts || b.addedAt / 1000;
-        return rb - ra;
-      }
-      return 0;
-    });
-
-    dom.list.innerHTML = targets.map(buildRow).join('');
-  }
-
-  function buildRow(t) {
-    const { score, b, c } = combinedScore(t);
-    const cd   = mugCooldownStr(t);
-    const icon = statusIcon(t);
-    const sc   = score !== null ? score : '?';
-    const fact = t.factionName ? ` [${t.factionName.slice(0, 12)}]` : '';
-    const chip = topSignalChip(t);
-
-    // Sub-label: spy data, profile level, or loading state
-    let subLabel;
-    if (t.spy) {
-      subLabel = `${formatStats(t.spy.total)} spy · ${spyAgeStr(t.spy)}`;
-    } else if (t.profileLoaded) {
-      subLabel = `Lv${t.level} · no spy data`;
-    } else {
-      subLabel = `Loading profile…`;
-    }
-
-    // Only show cash score when real cash data exists
-    const hasCash = (t.attacks || []).some(a => a.outcome === 'won' && a.cashTaken > 0);
-    const winLabel = b !== null ? `Win:${b}` : 'Win:?';
-    const cashLabel = hasCash ? ` Cash:${c}` : '';
-    const cash = hasCash ? avgCashStr(t) : null;
-
-    return `
-      <div class="ttt-row" data-tid="${t.id}">
-        <span class="ttt-badge" style="color:${scoreColour(score)}" title="Combined score (win rate × 0.55 + cash likelihood × 0.45)">${sc}</span>
-        <span style="font-size:13px">${icon}</span>
-        <span class="ttt-row-name">
-          ${t.name}${fact}<br>
-          <span class="ttt-sub">${subLabel}</span>
-          ${chip ? `<br>${chip}` : ''}
-        </span>
-        <span class="ttt-row-meta">
-          ${cd ? `<span class="ttt-cd">⏱${cd}</span><br>` : ''}
-          <span style="color:#666">${winLabel}${cashLabel}</span>
-          ${cash ? `<br><span style="color:#9fe8b0">${cash}</span>` : ''}
-        </span>
-        <button class="ttt-del" data-id="${t.id}" title="Remove target">✕</button>
-      </div>
-    `;
-  }
-
-  function tickCooldowns() {
-    document.querySelectorAll('[data-tid]').forEach((row) => {
-      const t = targetDB[row.dataset.tid];
-      if (!t) return;
-      const cd = mugCooldownStr(t);
-      const cdEl = row.querySelector('.ttt-cd');
-      if (cd && cdEl) { cdEl.textContent = `⏱${cd}`; }
-      else if (cd && !cdEl) {
-        const meta = row.querySelector('.ttt-row-meta');
-        if (meta) meta.insertAdjacentHTML('afterbegin', `<span class="ttt-cd">⏱${cd}</span><br>`);
-      } else if (!cd && cdEl) {
-        cdEl.nextSibling?.remove(); // the <br>
-        cdEl.remove();
-      }
-    });
-  }
-
-  // ---------------------------------------------------------------
-  // Profile page overlay
+  // Profile overlay
   // ---------------------------------------------------------------
   async function injectOverlay() {
     if (document.getElementById('ttt-overlay')) return;
-    const m = window.location.search.match(/XID=(\d+)/);
+    const m = location.search.match(/XID=(\d+)/i);
     if (!m) return;
-    const id = m[1];
+    const playerId = m[1];
 
-    // Find a DOM anchor. Torn's profile layout uses various class names across
-    // browser / PDA views; we try several and fall back gracefully.
-    const selectors = [
-      '.profile-container',
-      '#profile-container',
-      '.player-title-wrap',
-      '.profile-basic-info',
-      '[class*="profile-wrapper"]',
-    ];
+    // Anchor: insert before the profile's main wrapper
     let anchor = null;
-    for (const sel of selectors) {
+    for (const sel of ['.profile-wrapper', '.profile-container', '#profile-container', '.basic-information']) {
       anchor = document.querySelector(sel);
       if (anchor) break;
     }
@@ -1018,131 +342,96 @@
 
     const overlay = document.createElement('div');
     overlay.id = 'ttt-overlay';
-    overlay.innerHTML = '<div class="ttt-ov-h">🎯 Target Tracker — loading…</div>';
-    anchor.after(overlay);
+    overlay.innerHTML = `
+      <div class="ttt-ov-hdr">🎯 Target Tracker <span style="color:#555;font-weight:normal">Loading…</span></div>
+    `;
+    anchor.before(overlay);
 
-    // Fetch data
-    if (!targetDB[id]) targetDB[id] = blankTarget(id, '', '');
-    await fetchProfile(id);
-    const spy = await fetchSpy(id);
-    const t = targetDB[id];
-    const { score, b, c } = combinedScore(t);
-    const cd = mugCooldownStr(t);
+    // Fetch in parallel
+    const [ffsData, me] = await Promise.all([getFfsStats(playerId), getMyStats()]);
+    const dom = readProfileDom();
+    const cash = cashSummary(playerId);
 
-    // Stats comparison line
-    const compLine = (() => {
-      if (!spy || !myStats?.total) return '<span style="color:#888">No spy data — using level estimate</span>';
-      const ratio = myStats.total / spy.total;
-      if (ratio >= 2.0) return '<span style="color:#9fe8b0">Strong advantage</span>';
-      if (ratio >= 1.2) return '<span style="color:#9fe8b0">Likely win</span>';
-      if (ratio >= 0.9) return '<span style="color:#f0d27a">Even match — risky</span>';
-      return '<span style="color:#f0a0a0">Outstatted — avoid</span>';
-    })();
+    // FFS data
+    const ff      = ffsData?.fair_fight ?? null;
+    const bsHuman = ffsData?.bs_estimate_human ?? null;
+    const dist    = ffsData?.distribution?.distribution_human ?? null;
+    const dataAge = ffsData?.last_updated ? fmtAge(ffsData.last_updated * 1000) : null;
+    const verdict = ffVerdict(ff);
 
-    const spyLine = spy
-      ? `${formatStats(spy.total)} total (${spyAgeStr(spy)})`
-      : 'Not in TornStats spy database';
+    // Mug protection
+    const lastHit     = cash?.lastHitTs || null;
+    const isProtected = lastHit && Date.now() - lastHit < PROTECT_MS;
+    const protMinsLeft = isProtected ? Math.ceil((lastHit + PROTECT_MS - Date.now()) / 60000) : null;
 
-    const myStatLine = myStats?.total
-      ? `${formatStats(myStats.total)} total (you)`
-      : 'Unknown — add battlestats to API key';
+    // Warnings
+    const lowYield = cash?.avg && cash.avg < 200000 && (dom.level || 0) > 30;
+    const highDef  = dist && /DEF[^)]*(\d+)%/i.exec(dist)?.[1] >= 50;
 
-    const cash = avgCashStr(t);
+    // My stats label
+    const myLabel = me?.total
+      ? `${me.total >= 1e9 ? (me.total / 1e9).toFixed(1) + 'B' : Math.round(me.total / 1e6) + 'M'}`
+      : null;
 
-    const inTargets = !!targetDB[id]?.addedAt;
-    const signals   = walletSignals(t);
-    const stats     = cashStats(t);
-    const sigColour = { good: '#9fe8b0', warn: '#f0d27a', bad: '#f0a0a0', info: '#888' };
-
-    const signalsHtml = signals.length
-      ? signals.map(s => `
-          <div style="margin-bottom:3px">
-            <span style="color:${sigColour[s.type]}">${s.label}</span>
-            ${s.detail ? `<span style="color:#666;font-size:10px"> — ${s.detail}</span>` : ''}
-          </div>`).join('')
-      : '<div style="color:#666;font-size:11px">No signals yet — refresh profile for live status</div>';
-
-    const cashStatsHtml = stats ? `
-      <div class="ttt-ov-r">
-        <span class="ttt-ov-l">Std deviation:</span>
-        <span class="ttt-ov-v">±${formatCash(stats.stdDev)} (${stats.cv < 0.3 ? 'consistent' : stats.cv > 0.8 ? 'erratic' : 'moderate'})</span>
-      </div>
-      ${stats.trend !== null ? `
-      <div class="ttt-ov-r">
-        <span class="ttt-ov-l">Recent trend:</span>
-        <span class="ttt-ov-v" style="color:${stats.trend > 0 ? '#9fe8b0' : '#f0d27a'}">
-          ${stats.trend > 0 ? '+' : ''}${stats.trend}% vs older hits
-        </span>
-      </div>` : ''}` : '';
+    const statusLine = dom.status ? `<div class="ttt-ov-row">
+      <span class="ttt-ov-lbl">Status:</span>
+      <span class="ttt-ov-val">${dom.status}</span>
+    </div>` : '';
 
     overlay.innerHTML = `
-      <div class="ttt-ov-h">🎯 Target Tracker</div>
-      ${cd ? `<div style="color:#f0d27a;margin-bottom:8px">⏱ Mug cooldown: ${cd}</div>` : ''}
-
-      <div class="ttt-ov-r">
-        <span class="ttt-ov-l">Their stats:</span>
-        <span class="ttt-ov-v">${spyLine}</span>
-      </div>
-      <div class="ttt-ov-r">
-        <span class="ttt-ov-l">Your stats:</span>
-        <span class="ttt-ov-v">${myStatLine}</span>
-      </div>
-      <div class="ttt-ov-r">
-        <span class="ttt-ov-l">Assessment:</span>
-        <span class="ttt-ov-v">${compLine}</span>
-      </div>
-      <div class="ttt-ov-r">
-        <span class="ttt-ov-l">Beatable / Cash:</span>
-        <span class="ttt-ov-v">
-          <span style="color:${scoreColour(b)}">${b !== null ? b : '?'}</span>
-          / <span style="color:${scoreColour(c)}">${c}</span>
-          &nbsp;<span style="color:#666;font-size:10px">(out of 100)</span>
+      <div class="ttt-ov-hdr">
+        🎯 Target Tracker
+        <span style="color:#555;font-weight:normal;font-size:10px">
+          ${dataAge ? `FFS data ${dataAge}` : ffsKey ? 'No FFS data' : 'Add FFScouter key in panel ⚙'}
         </span>
       </div>
-      <div class="ttt-ov-r">
-        <span class="ttt-ov-l">Fight record:</span>
-        <span class="ttt-ov-v">${fightRecordStr(t)}</span>
-      </div>
-      <div class="ttt-ov-r">
-        <span class="ttt-ov-l">Avg cash taken:</span>
-        <span class="ttt-ov-v" style="color:#9fe8b0">${cash || 'No cash history yet'}</span>
-      </div>
-      ${cashStatsHtml}
 
-      <div style="margin-top:8px;margin-bottom:4px;color:#aaa;font-size:10px;font-weight:bold">
-        WALLET SIGNALS
-      </div>
-      <div style="font-size:11px">
-        ${signalsHtml}
+      <div class="ttt-ov-verdict" style="color:${verdict.colour}">
+        ${verdict.text}${ff !== null ? ` · FF ${ff.toFixed(2)}` : ''}
       </div>
 
-      <div class="ttt-ov-actions">
-        <button class="ttt-btn ttt-green" id="ttt-ov-add">${inTargets ? '★ In targets' : '+ Add to targets'}</button>
-        <button class="ttt-btn" id="ttt-ov-spy">↻ Refresh spy</button>
-        <button class="ttt-btn" id="ttt-ov-refresh">↻ Refresh status</button>
+      ${bsHuman ? `<div class="ttt-ov-row">
+        <span class="ttt-ov-lbl">Their stats:</span>
+        <span class="ttt-ov-val">${bsHuman}${dist ? ` · ${dist}` : ''}</span>
+      </div>` : ''}
+
+      ${myLabel ? `<div class="ttt-ov-row">
+        <span class="ttt-ov-lbl">Your stats:</span>
+        <span class="ttt-ov-val">${myLabel}</span>
+      </div>` : ''}
+
+      ${statusLine}
+
+      <hr class="ttt-sep">
+
+      <div class="ttt-ov-row">
+        <span class="ttt-ov-lbl">Fight record:</span>
+        <span class="ttt-ov-val">${cash ? `${cash.wins}W / ${cash.losses}L` : 'No history'}</span>
       </div>
+
+      ${cash?.avg ? `<div class="ttt-ov-row">
+        <span class="ttt-ov-lbl">Avg cash taken:</span>
+        <span class="ttt-ov-val" style="color:#9fe8b0">${fmtCash(cash.avg)} (${cash.samples} fights)</span>
+      </div>` : ''}
+
+      ${lastHit ? `<div class="ttt-ov-row">
+        <span class="ttt-ov-lbl">Last hit:</span>
+        <span class="ttt-ov-val">${fmtAge(lastHit)}</span>
+      </div>` : ''}
+
+      ${isProtected ? `<div class="ttt-bad">🛡 Mug protection active — expires in ~${protMinsLeft}m</div>` : ''}
+      ${lowYield    ? `<div class="ttt-warn">⚠️ Low cash returns — likely wearing 7★ clothing</div>` : ''}
+      ${highDef     ? `<div class="ttt-warn">⚔️ High DEF build — harder to mug</div>` : ''}
+
+      <button class="ttt-ov-btn" id="ttt-ov-refresh">↻ Refresh FFS data</button>
     `;
-
-    document.getElementById('ttt-ov-add').addEventListener('click', () => {
-      saveDB();
-      document.getElementById('ttt-ov-add').textContent = '★ In targets';
-    });
-
-    document.getElementById('ttt-ov-spy').addEventListener('click', async () => {
-      const btn = document.getElementById('ttt-ov-spy');
-      btn.textContent = 'Fetching…';
-      if (targetDB[id]) targetDB[id].spyFetchedAt = 0;
-      await fetchSpy(id, true);
-      overlay.remove();
-      injectOverlay();
-    });
 
     document.getElementById('ttt-ov-refresh').addEventListener('click', async () => {
       const btn = document.getElementById('ttt-ov-refresh');
       btn.textContent = 'Refreshing…';
-      await fetchProfile(id);
-      overlay.remove();
-      injectOverlay();
+      delete ffsCache[playerId];
+      document.getElementById('ttt-overlay')?.remove();
+      await injectOverlay();
     });
   }
 
@@ -1150,76 +439,211 @@
   // Attack result capture
   // ---------------------------------------------------------------
   function watchAttackResult() {
-    // The attack result appears in the DOM after the fight resolves.
-    // We watch for the result container to appear and parse it.
-    let captured = false;
+    let done = false;
     const obs = new MutationObserver(() => {
-      if (captured) return;
-      // Torn injects result into various elements depending on version
-      const result = document.querySelector(
-        '.log-wrap, .attack-result, [class*="attackResult"], .log-info-row'
-      );
-      if (!result) return;
-      captured = true;
+      if (done) return;
+      const el = document.querySelector('.log-wrap, .attack-result, [class*="attackResult"]');
+      if (!el) return;
+      done = true;
       obs.disconnect();
-      parseAndRecordResult(result);
+
+      const text = el.textContent || '';
+
+      // Target ID
+      let targetId = null;
+      const urlM = location.search.match(/user2ID=(\d+)|target=(\d+)/i);
+      if (urlM) targetId = urlM[1] || urlM[2];
+      if (!targetId) {
+        const link = document.querySelector('a[href*="profiles.php?XID="]');
+        if (link) { const lm = link.href.match(/XID=(\d+)/); if (lm) targetId = lm[1]; }
+      }
+      if (!targetId) return;
+
+      let outcome = 'unknown';
+      if (/mugged|hospitalized/i.test(text)) outcome = 'won';
+      else if (/lost|defeated/i.test(text)) outcome = 'lost';
+      else if (/stalemate|escaped/i.test(text)) outcome = 'stalemate';
+
+      let cash = 0;
+      const cashM = text.match(/\$[\d,]+/);
+      if (cashM) cash = parseInt(cashM[0].replace(/[$,]/g, '')) || 0;
+
+      if (outcome !== 'unknown') recordResult(targetId, outcome, cash);
     });
     obs.observe(document.body, { childList: true, subtree: true });
   }
 
-  function parseAndRecordResult(el) {
-    const text = el.textContent || '';
+  // ---------------------------------------------------------------
+  // Target finder panel
+  // ---------------------------------------------------------------
+  function buildFinder() {
+    if (document.getElementById('ttt-finder')) return;
 
-    // Target player ID from URL or page link
-    let targetId = null;
-    const urlM = window.location.search.match(/user2ID=(\d+)|target=(\d+)/i);
-    if (urlM) targetId = urlM[1] || urlM[2];
-    if (!targetId) {
-      const link = document.querySelector('a[href*="profiles.php?XID="]');
-      if (link) { const lm = link.href.match(/XID=(\d+)/); if (lm) targetId = lm[1]; }
+    const maxFF  = GM_getValue('ttt_maxFF',   '1.5');
+    const minLv  = GM_getValue('ttt_minLv',   '1');
+    const maxLv  = GM_getValue('ttt_maxLv',   '100');
+
+    const panel = document.createElement('div');
+    panel.id = 'ttt-finder';
+    panel.classList.add('ttt-col');
+    panel.innerHTML = `
+      <h3>
+        <span>🎯 Target Finder</span>
+        <span style="display:flex;gap:4px;align-items:center">
+          <button class="ttt-icon-btn" id="ttt-gear">⚙</button>
+          <button class="ttt-icon-btn" id="ttt-tog">▲</button>
+        </span>
+      </h3>
+      <div class="ttt-fb">
+        <div class="ttt-controls">
+          <span>Max FF:</span>
+          <input id="ttt-maxff" type="number" min="1" max="5" step="0.1" value="${maxFF}" style="width:46px">
+          <span>Level:</span>
+          <input id="ttt-minlv" type="number" min="1" max="100" value="${minLv}" style="width:38px">
+          <span>–</span>
+          <input id="ttt-maxlv" type="number" min="1" max="100" value="${maxLv}" style="width:38px">
+          <button class="ttt-find-btn" id="ttt-find">Find</button>
+        </div>
+        <div id="ttt-results" class="ttt-empty">
+          Set your max fair fight and click Find.<br>
+          Lower FF = easier target. Start with 1.5.
+        </div>
+        <div id="ttt-settings" class="ttt-settings-panel" style="display:none">
+          <label>FFScouter API key</label>
+          <input id="ttt-ffs-inp" type="password" value="${ffsKey}" placeholder="16-char FFScouter key">
+          <label>Torn API key (for your own stats)</label>
+          <input id="ttt-torn-inp" type="password" value="${tornKey}" placeholder="Limited access key">
+          <button class="ttt-find-btn" id="ttt-save" style="width:100%;text-align:center">Save keys</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    // Collapse / expand
+    const tog = document.getElementById('ttt-tog');
+    function togglePanel() {
+      panel.classList.toggle('ttt-col');
+      tog.textContent = panel.classList.contains('ttt-col') ? '▲' : '▼';
     }
-    if (!targetId) return;
+    panel.querySelector('h3').addEventListener('click', togglePanel);
+    tog.addEventListener('pointerdown', (e) => e.stopPropagation());
+    tog.addEventListener('click', (e) => { e.stopPropagation(); togglePanel(); });
 
-    // Outcome
-    let outcome = 'unknown';
-    const lower = text.toLowerCase();
-    if (/mugged|hospitalized|attacked and won/i.test(text)) outcome = 'won';
-    else if (/lost|was defeated/i.test(text)) outcome = 'lost';
-    else if (/stalemate|ran away|escaped/i.test(text)) outcome = 'stalemate';
-
-    // Cash taken — "$X,XXX,XXX" pattern in result text
-    let cashTaken = 0;
-    const cashM = text.match(/\$[\d,]+/);
-    if (cashM) cashTaken = parseInt(cashM[0].replace(/[$,]/g, '')) || 0;
-
-    // Respect
-    let respect = 0;
-    const respM = text.match(/([\d.]+)\s*respect/i);
-    if (respM) respect = parseFloat(respM[1]) || 0;
-
-    if (!targetDB[targetId]) targetDB[targetId] = blankTarget(targetId, '', '');
-    const pushed = pushAttack(targetId, {
-      ts: Math.floor(Date.now() / 1000),
-      outcome,
-      cashTaken,
-      respectGained: respect,
+    // Settings
+    document.getElementById('ttt-gear').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const s = document.getElementById('ttt-settings');
+      s.style.display = s.style.display === 'block' ? 'none' : 'block';
     });
-    if (pushed) saveDB();
+
+    // Save keys
+    document.getElementById('ttt-save').addEventListener('click', async () => {
+      const btn  = document.getElementById('ttt-save');
+      const newFfs  = document.getElementById('ttt-ffs-inp').value.trim();
+      const newTorn = document.getElementById('ttt-torn-inp').value.trim();
+
+      if (newTorn && newTorn !== tornKey) {
+        btn.textContent = 'Verifying Torn key…';
+        try {
+          const d = await gmFetch(`https://api.torn.com/user/?selections=basic&key=${newTorn}`);
+          if (d.error) {
+            alert('Torn rejected that key: ' + d.error.error);
+            btn.textContent = 'Save keys'; return;
+          }
+        } catch {
+          alert('Could not reach Torn API.');
+          btn.textContent = 'Save keys'; return;
+        }
+      }
+
+      ffsKey = newFfs; tornKey = newTorn;
+      GM_setValue('ttt_ffsKey', ffsKey);
+      GM_setValue('ttt_tornKey', tornKey);
+      myStats = null; myStatsFetched = 0;
+      GM_setValue('ttt_myStats', null);
+      btn.textContent = 'Saved ✓';
+      setTimeout(() => { btn.textContent = 'Save keys'; }, 2000);
+      getMyStats(); // warm cache now
+    });
+
+    // Find
+    document.getElementById('ttt-find').addEventListener('click', async () => {
+      if (!ffsKey) {
+        document.getElementById('ttt-results').innerHTML =
+          `<div class="ttt-empty">Add your FFScouter key in settings (⚙).</div>`;
+        return;
+      }
+
+      const btn     = document.getElementById('ttt-find');
+      const results = document.getElementById('ttt-results');
+      const maxFF_  = parseFloat(document.getElementById('ttt-maxff').value) || 1.5;
+      const minLv_  = parseInt(document.getElementById('ttt-minlv').value)   || 1;
+      const maxLv_  = parseInt(document.getElementById('ttt-maxlv').value)   || 100;
+
+      GM_setValue('ttt_maxFF', String(maxFF_));
+      GM_setValue('ttt_minLv', String(minLv_));
+      GM_setValue('ttt_maxLv', String(maxLv_));
+
+      btn.textContent = 'Searching…';
+      btn.disabled = true;
+      results.innerHTML = `<div class="ttt-empty">Asking FFScouter…</div>`;
+
+      const data = await findTargets({ maxFF: maxFF_, minLevel: minLv_, maxLevel: maxLv_ });
+      btn.textContent = 'Find';
+      btn.disabled = false;
+
+      if (!data || data.error || !data.targets?.length) {
+        const hint = data?.code === 17
+          ? 'No matches. Try raising Max FF or widening the level range.'
+          : data?.code === 6
+          ? 'FFScouter key rejected. Check it is registered at ffscouter.com.'
+          : 'No results.';
+        results.innerHTML = `<div class="ttt-empty">${hint}</div>`;
+        return;
+      }
+
+      results.innerHTML = data.targets.map(t => {
+        const v    = ffVerdict(t.fair_fight);
+        const cash = cashSummary(t.player_id);
+        const avgStr = cash?.avg ? ` · ${fmtCash(cash.avg)} avg` : '';
+        return `
+          <div class="ttt-t-row" data-id="${t.player_id}">
+            <span class="ttt-ff-pill" style="color:${v.colour}">${t.fair_fight?.toFixed(1) ?? '?'}</span>
+            <span style="flex:1">
+              <div class="ttt-t-name">${t.name} [${t.player_id}]</div>
+              <div class="ttt-t-sub">
+                Lv${t.level} · ${t.bs_estimate_human ?? '?'}${avgStr}
+                ${t.last_action ? ' · ' + fmtAge(t.last_action * 1000) : ''}
+              </div>
+            </span>
+          </div>
+        `;
+      }).join('');
+
+      results.querySelectorAll('.ttt-t-row').forEach(row => {
+        row.addEventListener('click', () => {
+          window.open(`/profiles.php?XID=${row.dataset.id}`, '_self');
+        });
+      });
+    });
   }
 
   // ---------------------------------------------------------------
   // SPA router
   // ---------------------------------------------------------------
   function route() {
-    ensurePanel();
-    const path   = window.location.pathname;
-    const search = window.location.search;
+    const path   = location.pathname;
+    const search = location.search;
 
     if (path.includes('profiles.php') && search.includes('XID=')) {
       injectOverlay();
-    }
-    if (path.includes('loader.php') && /attack/i.test(search)) {
+    } else if (path.includes('loader.php') && /attack/i.test(search)) {
       watchAttackResult();
+    }
+
+    // Finder everywhere except profile and attack pages
+    if (!path.includes('profiles.php') && !path.includes('loader.php')) {
+      buildFinder();
     }
   }
 
@@ -1227,30 +651,21 @@
   // Init
   // ---------------------------------------------------------------
   async function init() {
-    await refreshMyStats();
+    getMyStats(); // warm cache silently
     route();
 
-    // SPA navigation watcher
-    let lastHref = location.href;
-    let routeTimer = null;
+    // SPA navigation
+    let lastHref  = location.href;
+    let debounce  = null;
     new MutationObserver(() => {
       if (location.href === lastHref) return;
       lastHref = location.href;
-      clearTimeout(routeTimer);
-      routeTimer = setTimeout(() => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
         document.getElementById('ttt-overlay')?.remove();
         route();
-      }, ROUTE_DEBOUNCE_MS);
+      }, 350);
     }).observe(document.body, { childList: true, subtree: true });
-
-    // Seed attack log in background after a short delay to let the page settle
-    setTimeout(async () => {
-      await seedAttackLog();
-      renderList();
-    }, 8000);
-
-    // Periodic own-stats refresh
-    setInterval(refreshMyStats, STATS_REFRESH_MS);
   }
 
   if (document.readyState === 'loading') {
