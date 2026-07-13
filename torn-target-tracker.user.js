@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Target Tracker
 // @namespace    https://github.com/mat-mcc-uk
-// @version      2.0.0
+// @version      2.0.1
 // @description  FFScouter-powered target finder and profile overlay for mugging
 // @author       mat-mcc-uk
 // @match        https://www.torn.com/*
@@ -529,9 +529,13 @@
     tog.addEventListener('pointerdown', (e) => e.stopPropagation());
     tog.addEventListener('click', (e) => { e.stopPropagation(); togglePanel(); });
 
-    // Settings
+    // Settings — expand the panel first if collapsed, then show settings
     document.getElementById('ttt-gear').addEventListener('click', (e) => {
       e.stopPropagation();
+      if (panel.classList.contains('ttt-col')) {
+        panel.classList.remove('ttt-col');
+        tog.textContent = '▼';
+      }
       const s = document.getElementById('ttt-settings');
       s.style.display = s.style.display === 'block' ? 'none' : 'block';
     });
