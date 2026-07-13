@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Target Tracker
 // @namespace    https://github.com/mat-mcc-uk
-// @version      1.0.2
+// @version      1.0.3
 // @description  Mug target identification and tracking using TornStats spy data
 // @author       mat-mcc-uk
 // @match        https://www.torn.com/*
@@ -167,6 +167,7 @@
       name:             name || `#${id}`,
       level:            0,
       profileLoaded:    false,
+      profileFetchedAt: 0,
       factionName:      factionName || '',
       factionId:        0,
       spy:              null,
@@ -205,6 +206,7 @@
       t.name             = d.name;
       t.level            = d.level;
       t.profileLoaded    = true;
+      t.profileFetchedAt = Date.now();
       t.factionName      = d.faction?.faction_name || '';
       t.factionId        = d.faction?.faction_id   || 0;
       t.lastActionTs     = d.last_action?.timestamp || 0;
@@ -392,11 +394,14 @@
   }
 
   function statusIcon(t) {
-    if (t.status === 'Hospital')                          return '🔴';
-    if (t.status === 'Traveling')                         return '✈️';
-    if (t.status === 'Jail' || t.status === 'Federal')    return '🔒';
-    if (t.lastActionStatus === 'Online')                  return '🟢';
-    if (t.lastActionStatus === 'Idle')                    return '🟡';
+    const STATUS_STALE_MS = 15 * 60 * 1000;
+    const isStale = t.profileFetchedAt && Date.now() - t.profileFetchedAt > STATUS_STALE_MS;
+
+    if (t.status === 'Hospital') return isStale ? '⚪' : '🔴';
+    if (t.status === 'Traveling') return isStale ? '⚪' : '✈️';
+    if (t.status === 'Jail' || t.status === 'Federal') return isStale ? '⚪' : '🔒';
+    if (t.lastActionStatus === 'Online') return '🟢';
+    if (t.lastActionStatus === 'Idle') return '🟡';
     return '⚫';
   }
 
@@ -475,8 +480,11 @@
       }
     }
 
-    // Hospital status with release timing.
-    if (t.status === 'Hospital') {
+    // Hospital status with release timing. Skip entirely if profile data is
+    // stale — the hospital window may have already passed.
+    const STATUS_STALE_MS = 15 * 60 * 1000;
+    const statusFresh = !t.profileFetchedAt || Date.now() - t.profileFetchedAt < STATUS_STALE_MS;
+    if (t.status === 'Hospital' && statusFresh) {
       if (t.hospitalUntil) {
         const minsLeft = Math.max(0, (t.hospitalUntil * 1000 - Date.now()) / 60000);
         if (minsLeft < 60) {
@@ -495,6 +503,12 @@
       } else {
         signals.push({ type: 'info', label: '🏥 In hospital', detail: 'cannot bank' });
       }
+    } else if (t.status === 'Hospital' && !statusFresh) {
+      signals.push({
+        type: 'warn',
+        label: '🏥 Was in hospital',
+        detail: 'status may be outdated — tap Refresh Status',
+      });
     }
 
     // Cash consistency (requires 3+ wins with cash recorded).
