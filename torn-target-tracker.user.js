@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Target Tracker
 // @namespace    https://github.com/mat-mcc-uk
-// @version      2.0.3
+// @version      2.0.4
 // @description  FFScouter-powered target finder and profile overlay for mugging
 // @author       mat-mcc-uk
 // @match        https://www.torn.com/*
@@ -425,15 +425,25 @@
 
       <button class="ttt-ov-btn" id="ttt-ov-refresh">↻ Refresh FFS data</button>
 
-      ${!ffsKey ? `
+      ${!ffsKey || !tornKey ? `
         <hr class="ttt-sep">
-        <div style="font-size:11px;color:#aaa;margin-bottom:4px">Enter your FFScouter key to see stat data:</div>
-        <div style="display:flex;gap:6px;margin-bottom:4px">
-          <input id="ttt-ov-ffs" type="password" placeholder="FFScouter key"
-            style="flex:1;background:#2a2a2a;color:#e0e0e0;border:1px solid #555;border-radius:3px;padding:3px 5px;font-size:11px">
-          <button class="ttt-ov-btn" id="ttt-ov-savekey" style="margin:0">Save</button>
+        <div style="font-size:11px;color:#aaa;margin-bottom:6px">
+          ${!ffsKey ? 'Enter your FFScouter key to see stat data:' : 'Enter your Torn key to see your own stats:'}
         </div>
-        <div style="font-size:10px;color:#555">Register free at ffscouter.com then find your key in account settings.</div>
+        ${!ffsKey ? `
+          <div style="font-size:10px;color:#666;margin-bottom:2px">FFScouter API key</div>
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input id="ttt-ov-ffs" type="password" placeholder="FFScouter key"
+              style="flex:1;background:#2a2a2a;color:#e0e0e0;border:1px solid #555;border-radius:3px;padding:3px 5px;font-size:11px">
+          </div>` : ''}
+        ${!tornKey ? `
+          <div style="font-size:10px;color:#666;margin-bottom:2px">Torn API key (Limited Access)</div>
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input id="ttt-ov-torn" type="password" placeholder="Torn key"
+              style="flex:1;background:#2a2a2a;color:#e0e0e0;border:1px solid #555;border-radius:3px;padding:3px 5px;font-size:11px">
+          </div>` : ''}
+        <button class="ttt-ov-btn" id="ttt-ov-savekey" style="margin-top:0">Save keys</button>
+        ${!ffsKey ? `<div style="font-size:10px;color:#555;margin-top:4px">Register free at ffscouter.com</div>` : ''}
       ` : ''}`;
 
     document.getElementById('ttt-ov-refresh').addEventListener('click', async () => {
@@ -444,18 +454,47 @@
       await injectOverlay();
     });
 
-    if (!ffsKey) {
+    if (!ffsKey || !tornKey) {
       document.getElementById('ttt-ov-savekey')?.addEventListener('click', async () => {
-        const val = document.getElementById('ttt-ov-ffs')?.value.trim();
-        if (!val) return;
-        ffsKey = val;
-        GM_setValue('ttt_ffsKey', ffsKey);
-        // Re-render overlay with the new key
+        const btn     = document.getElementById('ttt-ov-savekey');
+        const ffsVal  = document.getElementById('ttt-ov-ffs')?.value.trim();
+        const tornVal = document.getElementById('ttt-ov-torn')?.value.trim();
+
+        if (tornVal && tornVal !== tornKey) {
+          btn.textContent = 'Verifying…';
+          try {
+            const d = await gmFetch(
+              `https://api.torn.com/user/?selections=basic,battlestats&key=${tornVal}`
+            );
+            if (d.error) {
+              alert('Torn rejected that key: ' + d.error.error);
+              btn.textContent = 'Save keys'; return;
+            }
+            // Pre-populate myStats from this response
+            myStats = {
+              tornId: d.player_id, name: d.name, level: d.level,
+              total: (d.strength||0)+(d.defense||0)+(d.speed||0)+(d.dexterity||0),
+            };
+            myStatsFetched = Date.now();
+            GM_setValue('ttt_myStats', myStats);
+            GM_setValue('ttt_myStatsFetched', myStatsFetched);
+          } catch {
+            alert('Could not reach Torn API.');
+            btn.textContent = 'Save keys'; return;
+          }
+        }
+
+        if (ffsVal)  { ffsKey  = ffsVal;  GM_setValue('ttt_ffsKey',  ffsKey);  }
+        if (tornVal) { tornKey = tornVal; GM_setValue('ttt_tornKey', tornKey); }
+
+        // Sync to finder panel inputs if visible
+        const ffsInp  = document.getElementById('ttt-ffs-inp');
+        const tornInp = document.getElementById('ttt-torn-inp');
+        if (ffsInp  && ffsVal)  ffsInp.value  = ffsKey;
+        if (tornInp && tornVal) tornInp.value = tornKey;
+
         document.getElementById('ttt-overlay')?.remove();
         await injectOverlay();
-        // Sync to finder panel input if it exists
-        const finderInput = document.getElementById('ttt-ffs-inp');
-        if (finderInput) finderInput.value = ffsKey;
       });
     }
   }
